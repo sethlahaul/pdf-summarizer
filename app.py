@@ -1,24 +1,37 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-import matplotlib.pyplot as plt
-from transformers import pipeline
-from rake_nltk import Rake
-import nltk
 import requests
 from io import BytesIO
+import google.generativeai as genai
 
-# Download required NLTK data once at startup
-nltk.download('stopwords', quiet=True)
+# Configure Gemini API
+def configure_gemini(api_key):
+    """Configure Gemini API with the provided key"""
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel('gemini-1.5-flash')
 
-# === Model Loading (Cached) ===
-@st.cache_resource
-def load_models():
-    """Load and cache NLP models to improve performance"""
-    return {
-        "summarizer": pipeline("summarization", model="facebook/bart-large-cnn"),
-        "qa": pipeline("question-answering", model="distilbert-base-uncased-distilled-squad")
-    }
+# Simple question answering function using Gemini
+def simple_qa(question, context, model):
+    """Question answering using Gemini"""
+    try:
+        prompt = f"""Based on the following context, answer the question. If the answer cannot be found in the context, say so.
+
+Context: {context}
+
+Question: {question}
+
+Answer:"""
+        response = model.generate_content(prompt)
+        return {
+            'answer': response.text,
+            'score': 0.8  # Gemini doesn't provide confidence scores, using a default value
+        }
+    except Exception as e:
+        return {
+            'answer': f"Error processing question: {str(e)}",
+            'score': 0.0
+        }
 
 # === PDF Processing Functions ===
 @st.cache_data
@@ -52,34 +65,69 @@ def load_pdf_from_url(url):
         return None
 
 # === Analysis Functions ===
-def summarize_text(text, summarizer, max_chunk_chars=1024):
-    """Split text into chunks and summarize each chunk"""
+def summarize_text(text, max_sentences=5):
+    """Summarize text using Google's Gemini model"""
     if not text.strip():
         return "No text content found to summarize."
-        
+    
     try:
+        # Get API key from session state
+        api_key = st.session_state.get("GEMINI_API_KEY")
+        
+        if not api_key:
+            st.error("Please enter your Gemini API key in the sidebar.")
+            return "Error: Gemini API key not found."
+        
+        # Configure Gemini
+        model = configure_gemini(api_key)
+        
+        # Split text into chunks of approximately 4000 characters to handle large documents
+        max_chunk_chars = 4000
         chunks = [text[i:i+max_chunk_chars] for i in range(0, len(text), max_chunk_chars)]
         summaries = []
         
         for chunk in chunks:
             if len(chunk.strip()) > 50:  # Only summarize substantial chunks
-                summary = summarizer(chunk, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
-                summaries.append(summary)
-                
+                prompt = f"Please provide a concise summary of the following text in {max_sentences} sentences or less:\n\n{chunk}"
+                response = model.generate_content(prompt)
+                if response.text:
+                    summaries.append(response.text)
+        
         return "\n\n".join(summaries) if summaries else "Could not generate summary."
+    
     except Exception as e:
         st.error(f"Error during summarization: {e}")
         return "Error generating summary."
 
 def extract_keywords(text, num_keywords=15):
-    """Extract key phrases from text using RAKE algorithm"""
+    """Extract key phrases from text using Gemini"""
     if not text.strip():
         return []
         
     try:
-        rake = Rake()
-        rake.extract_keywords_from_text(text)
-        return rake.get_ranked_phrases_with_scores()[:num_keywords]
+        # Get API key from session state
+        api_key = st.session_state.get("GEMINI_API_KEY")
+        if not api_key:
+            st.error("Please enter your Gemini API key in the sidebar.")
+            return []
+            
+        model = configure_gemini(api_key)
+        prompt = f"""Extract {num_keywords} key phrases or keywords from the following text. 
+        Return them in the format: "keyword1 (score1), keyword2 (score2), ..." where score is between 0 and 1.
+        
+        Text: {text}"""
+        
+        response = model.generate_content(prompt)
+        if response.text:
+            # Parse the response to extract keywords and scores
+            keywords = []
+            for item in response.text.split(','):
+                if '(' in item and ')' in item:
+                    keyword = item.split('(')[0].strip()
+                    score = float(item.split('(')[1].split(')')[0].strip())
+                    keywords.append((score, keyword))
+            return keywords
+        return []
     except Exception as e:
         st.error(f"Error extracting keywords: {e}")
         return []
@@ -127,6 +175,9 @@ st.title("📄 Smart PDF Analyzer (Local AI Toolkit)")
 
 # Sidebar options
 st.sidebar.header("🔧 View Options")
+gemini_api_key = st.sidebar.text_input("Enter your Gemini API Key", type="password", key="gemini_api_input")
+if gemini_api_key:
+    st.session_state["GEMINI_API_KEY"] = gemini_api_key
 show_summary = st.sidebar.checkbox("Show Summary", value=True)
 show_keywords = st.sidebar.checkbox("Show Keywords", value=True)
 show_tables_option = st.sidebar.checkbox("Show Tables", value=True)
@@ -146,9 +197,6 @@ if pdf_url and not uploaded_file:
 
 # Main content processing
 if pdf_file:
-    # Load models
-    models = load_models()
-    
     # Extract content
     with st.spinner("🔍 Reading and parsing PDF..."):
         text, tables = extract_pdf_content(pdf_file)
@@ -176,7 +224,8 @@ if pdf_file:
             if submitted and user_question:
                 with st.spinner("Thinking..."):
                     try:
-                        answer = models["qa"](question=user_question, context=text)
+                        model = configure_gemini(st.session_state.get("GEMINI_API_KEY"))
+                        answer = simple_qa(question=user_question, context=text, model=model)
                         st.session_state.chat_history.append({
                             "question": user_question,
                             "answer": answer['answer'],
@@ -196,7 +245,7 @@ if pdf_file:
         if show_summary:
             st.subheader("📃 Summary")
             with st.spinner("Summarizing..."):
-                summary = summarize_text(text, models["summarizer"])
+                summary = summarize_text(text)
                 st.write(summary)
                 st.download_button("💾 Download Summary", data=summary, file_name="summary.txt")
         

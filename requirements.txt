@@ -1,9 +1,5 @@
 streamlit
 pdfplumber
 pandas
-matplotlib
-transformers
-rake_nltk
-nltk
 requests
-torch
+google-generativeai
